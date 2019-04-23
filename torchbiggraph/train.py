@@ -7,21 +7,37 @@
 # LICENSE.txt file in the root directory of this source tree.
 
 import argparse
+import ctypes
 import os.path
 import sys
 import time
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from functools import partial
 from itertools import chain
-from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
+from multiprocessing.connection import wait as mp_wait
+from typing import (
+    Any,
+    Dict,
+    Generator,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Set,
+)
 
+import gc
+import numpy as np
 import torch
 import torch.distributed as td
+import torch.multiprocessing as mp
+from torch import nn
 from torch.optim import Adagrad, Optimizer
 
 from torchbiggraph.batching import (
     AbstractBatchProcessor,
-    call,
     process_in_batches,
 )
 from torchbiggraph.bucket_scheduling import (
@@ -42,7 +58,7 @@ from torchbiggraph.distributed import (
     start_server,
 )
 from torchbiggraph.edgelist import EdgeList
-from torchbiggraph.eval import RankingEvaluator
+from torchbiggraph.entitylist import EntityList
 from torchbiggraph.fileio import (
     CheckpointManager,
     ConfigMetadataProvider,
@@ -69,17 +85,18 @@ from torchbiggraph.types import (
     Bucket,
     EntityName,
     FloatTensorType,
+    GPURank,
+    LongTensorType,
     ModuleStateDict,
     OptimizerStateDict,
     Partition,
     Rank,
     Side,
+    SubPartition,
 )
 from torchbiggraph.util import (
     DummyOptimizer,
-    create_pool,
     fast_approx_rand,
-    get_num_workers,
     get_partitioned_types,
     log,
     round_up_to_nearest_multiple,
@@ -101,7 +118,8 @@ class Trainer(AbstractBatchProcessor):
     ) -> None:
         super().__init__()
         self.global_optimizer = global_optimizer
-        self.entity_optimizers: Dict[Tuple[EntityName, Partition], Optimizer] = {}
+        self.unpartitioned_entity_optimizers: Dict[EntityName, Optimizer] = {}
+        self.partitioned_entity_optimizers: Dict[Tuple[EntityName, Partition, SubPartition], Optimizer] = {}
 
         if loss_fn is LossFunction.LOGISTIC:
             self.loss_fn = LogisticLoss()
@@ -137,33 +155,14 @@ class Trainer(AbstractBatchProcessor):
             count=len(batch_edges))
 
         loss.backward()
+
         self.global_optimizer.step(closure=None)
-        for optimizer in self.entity_optimizers.values():
+        for optimizer in self.unpartitioned_entity_optimizers.values():
+            optimizer.step(closure=None)
+        for optimizer in self.partitioned_entity_optimizers.values():
             optimizer.step(closure=None)
 
         return stats
-
-
-class TrainingRankingEvaluator(RankingEvaluator):
-
-    def __init__(
-        self,
-        override_num_batch_negs: int,
-        override_num_uniform_negs: int,
-    ) -> None:
-        super().__init__()
-        self.override_num_batch_negs = override_num_batch_negs
-        self.override_num_uniform_negs = override_num_uniform_negs
-
-    def process_one_batch(
-        self,
-        model: MultiRelationEmbedder,
-        batch_edges: EdgeList,
-    ) -> Stats:
-        with override_model(model,
-                            num_batch_negs=self.override_num_batch_negs,
-                            num_uniform_negs=self.override_num_uniform_negs):
-            return super().process_one_batch(model, batch_edges)
 
 
 def init_embs(
@@ -256,11 +255,285 @@ class IterationManager(MetadataProvider):
         }
 
 
+EmbeddingHolder = Dict[Tuple[EntityName, Partition], Tuple[LongTensorType, FloatTensorType, RowAdagrad]]
+SubEmbeddingHolder = Dict[Tuple[EntityName, Partition, SubPartition], Tuple[nn.Parameter, RowAdagrad]]
+
+
+class SubprocessArgs(NamedTuple):
+    lhs_partitioned_types: Set[str]
+    rhs_partitioned_types: Set[str]
+    lhs_part: Partition
+    rhs_part: Partition
+    lhs_subpart: SubPartition
+    rhs_subpart: SubPartition
+    model: MultiRelationEmbedder
+    trainer: Trainer
+    holder: EmbeddingHolder
+    subpart_slices: Dict[Tuple[EntityName, Partition, SubPartition], slice]
+    rel: LongTensorType
+    lhs_subparts: LongTensorType
+    rhs_subparts: LongTensorType
+    lhs_offsets: LongTensorType
+    rhs_offsets: LongTensorType
+    batch_size: int
+    lr: float
+
+
+class SubprocessReturn(NamedTuple):
+    gpu_idx: GPURank
+    stats: Stats
+
+
+class GPUProcess(mp.Process):
+
+    def __init__(self, gpu_idx: GPURank) -> None:
+        super().__init__(daemon=True, name=f"GPU worker #{gpu_idx}")
+        self.gpu_idx = gpu_idx
+        self.master_endpoint, self.worker_endpoint = mp.Pipe()
+        self.pinned_ptrs_and_sizes: Set[Tuple[int, int]] = set()
+
+    @property
+    def my_device(self) -> torch.device:
+        return torch.device("cuda", index=self.gpu_idx)
+
+    def run(self) -> None:
+        torch.set_num_threads(1)
+        torch.cuda.set_device(self.my_device)
+        while True:
+            try:
+                job: SubprocessArgs = self.worker_endpoint.recv()
+            except EOFError:
+                break
+            if job is None:
+                break
+
+            # print(f"GPU #{self.gpu_idx}, before job has {torch.cuda.memory_allocated(self.my_device):,} bytes allocated")
+            stats = self.do_one_job(
+                lhs_partitioned_types=job.lhs_partitioned_types,
+                rhs_partitioned_types=job.rhs_partitioned_types,
+                lhs_part=job.lhs_part,
+                rhs_part=job.rhs_part,
+                lhs_subpart=job.lhs_subpart,
+                rhs_subpart=job.rhs_subpart,
+                model=job.model,
+                trainer=job.trainer,
+                holder=job.holder,
+                subpart_slices=job.subpart_slices,
+                rel=job.rel,
+                lhs_subparts=job.lhs_subparts,
+                rhs_subparts=job.rhs_subparts,
+                lhs_offsets=job.lhs_offsets,
+                rhs_offsets=job.rhs_offsets,
+                batch_size=job.batch_size,
+                lr=job.lr,
+            )
+            # del job
+            # torch.cuda.synchronize(self.my_device)
+            # gc.collect()
+            # torch.cuda.empty_cache()
+            # torch.cuda.synchronize(self.my_device)
+            # print(f"GPU #{self.gpu_idx}, after job has {torch.cuda.memory_allocated(self.my_device):,} bytes allocated")
+
+            self.worker_endpoint.send(SubprocessReturn(gpu_idx=self.gpu_idx, stats=stats))
+
+    def do_one_job(
+        self,
+        lhs_partitioned_types: Set[str],
+        rhs_partitioned_types: Set[str],
+        lhs_part: Partition,
+        rhs_part: Partition,
+        lhs_subpart: SubPartition,
+        rhs_subpart: SubPartition,
+        model: MultiRelationEmbedder,
+        trainer: Trainer,
+        holder: EmbeddingHolder,
+        subpart_slices: Dict[Tuple[EntityName, Partition, SubPartition], slice],
+        rel: LongTensorType,
+        lhs_subparts: LongTensorType,
+        rhs_subparts: LongTensorType,
+        lhs_offsets: LongTensorType,
+        rhs_offsets: LongTensorType,
+        batch_size: int,
+        lr: float,
+    ) -> Stats:
+        these_ptrs_and_sizes: Set[Tuple[int, int]] = set()
+        for _, embeddings, _ in holder.values():
+            these_ptrs_and_sizes.add((
+                embeddings.data_ptr(),
+                embeddings.numel() * embeddings.element_size(),
+            ))
+
+        for pyptr, pysize in self.pinned_ptrs_and_sizes - these_ptrs_and_sizes:
+            cptr = ctypes.c_void_p(pyptr)
+            csize = ctypes.c_size_t(pysize)
+            cflags = ctypes.c_uint(0)
+            res = torch.cuda.cudart().cudaHostUnregister(cptr, csize, cflags)
+            torch.cuda.check_error(res)
+
+        for pyptr, pysize in these_ptrs_and_sizes - self.pinned_ptrs_and_sizes:
+            cptr = ctypes.c_void_p(pyptr)
+            csize = ctypes.c_size_t(pysize)
+            cflags = ctypes.c_uint(0)
+            res = torch.cuda.cudart().cudaHostRegister(cptr, csize, cflags)
+            torch.cuda.check_error(res)
+
+        for _, embeddings, _ in holder.values():
+            assert embeddings.is_pinned()
+
+        self.pinned_ptrs_and_sizes = these_ptrs_and_sizes
+
+        sub_holder: SubEmbeddingHolder = {}
+
+        occurrences: Dict[Tuple[EntityName, Partition, SubPartition], Set[Side]] = defaultdict(set)
+        for entity_name in lhs_partitioned_types:
+            occurrences[entity_name, lhs_part, lhs_subpart].add(Side.LHS)
+        for entity_name in rhs_partitioned_types:
+            occurrences[entity_name, rhs_part, rhs_subpart].add(Side.RHS)
+
+        for entity_name, part, subpart in occurrences.keys():
+            _, embeddings, optimizer = holder[entity_name, part]
+            subpart_slice = subpart_slices[entity_name, part, subpart]
+
+            # TODO have two permanent storages on GPU and move stuff in and out from them
+            # print(f"GPU #{self.gpu_idx} allocating {(subpart_slice.stop - subpart_slice.start) * embeddings.shape[1] * 4:,} bytes", flush=True)
+            gpu_embeddings = torch.empty(
+                (subpart_slice.stop - subpart_slice.start, embeddings.shape[1]),
+                dtype=torch.float32,
+                device=self.my_device,
+            )
+            gpu_embeddings.copy_(embeddings[subpart_slice])
+            gpu_embeddings = nn.Parameter(gpu_embeddings)
+            gpu_optimizer = RowAdagrad([gpu_embeddings], lr=lr)
+            cpu_state, = optimizer.state.values()
+            gpu_state, = gpu_optimizer.state.values()
+            # print(f"GPU #{self.gpu_idx} allocating {(subpart_slice.stop - subpart_slice.start) * 4:,} bytes", flush=True)
+            gpu_state["sum"] = cpu_state["sum"][subpart_slice].to(self.my_device)
+
+            sub_holder[entity_name, part, subpart] = (gpu_embeddings, gpu_optimizer)
+
+        for (entity_name, part, subpart), (gpu_embeddings, gpu_optimizer) in sub_holder.items():
+            for side in occurrences[entity_name, part, subpart]:
+                model.set_embeddings(entity_name, gpu_embeddings, side)
+                trainer.partitioned_entity_optimizers[entity_name, part, subpart] = gpu_optimizer
+
+        lhs_mask = lhs_subparts.eq(lhs_subpart)
+        rhs_mask = rhs_subparts.eq(rhs_subpart)
+        this_indices = (lhs_mask & rhs_mask).nonzero().flatten()
+        np.random.shuffle(this_indices.numpy())
+        # print(f"GPU #{self.gpu_idx} allocating {this_indices.shape[0] * 3 * 8:,} bytes", flush=True)
+        gpu_edges = EdgeList(
+            EntityList.from_tensor(lhs_offsets[this_indices]),
+            EntityList.from_tensor(rhs_offsets[this_indices]),
+            rel[this_indices],
+        ).to(self.my_device)
+        print(f"GPU #{self.gpu_idx} got {this_indices.shape[0]} edges", flush=True)
+
+        stats = process_in_batches(
+            batch_size=batch_size,
+            model=model,
+            batch_processor=trainer,
+            edges=gpu_edges,
+        )
+
+        for (entity_name, part, subpart), (gpu_embeddings, gpu_optimizer) in sub_holder.items():
+            _, embeddings, optimizer = holder[entity_name, part]
+            subpart_slice = subpart_slices[entity_name, part, subpart]
+
+            embeddings[subpart_slice].copy_(gpu_embeddings.detach())
+            del gpu_embeddings
+            cpu_state, = optimizer.state.values()
+            gpu_state, = gpu_optimizer.state.values()
+            cpu_state["sum"][subpart_slice].copy_(gpu_state["sum"])
+            del gpu_state["sum"]
+
+        return stats
+
+
+class GPUProcessPool:
+
+    def __init__(self, num_gpus: int):
+        self.processes: List[GPUProcess] = [
+            GPUProcess(gpu_idx) for gpu_idx in range(num_gpus)]
+        for p in self.processes:
+            p.start()
+
+    @property
+    def num_gpus(self):
+        return len(self.processes)
+
+    def schedule(self, gpu_idx: GPURank, args: SubprocessArgs) -> None:
+        self.processes[gpu_idx].master_endpoint.send(args)
+
+    def wait(self) -> Generator[Tuple[GPURank, SubprocessReturn], None, None]:
+        all_objects = [p.sentinel for p in self.processes] + [p.master_endpoint for p in self.processes]
+        ready_objects = mp_wait(all_objects)
+        for obj in ready_objects:
+            for p in self.processes:
+                if obj is p.sentinel:
+                    raise RuntimeError(
+                        f"GPU worker #{p.gpu_idx} (PID: {p.pid}) terminated "
+                        f"unexpectedly with exit code {p.exitcode}")  # @nocommit exitcode is still None at this time
+                if obj is p.master_endpoint:
+                    res = p.master_endpoint.recv()
+                    yield p.gpu_idx, res
+
+    def join(self):
+        for p in self.processes:
+            p.master_endpoint.send(None)  # This shouldn't be necessary @nocommit
+            p.master_endpoint.close()
+            p.join()
+
+
+class NothingToAcquire(Exception):
+    pass
+
+
+class Locker:
+
+    def __init__(self, num_lhs: int, num_rhs: int) -> None:
+        self.num_lhs = num_lhs
+        self.num_rhs = num_rhs
+        self.locks: Dict[Rank, Tuple[SubPartition, SubPartition]] = {}
+        self.prev_locked: Dict[Rank, Tuple[SubPartition, SubPartition]] = {}
+        self.locked: Dict[SubPartition, Dict[Side, Rank]] = defaultdict(dict)
+        self.done: Set[Tuple[SubPartition, SubPartition]] = set()
+
+    def acquire(self, rank: Rank) -> Tuple[SubPartition, SubPartition]:
+        if rank in self.locks:
+            raise ValueError(f"Rank {rank} is already locking {self.locks[rank]}")
+        to_do = {
+            (lhs_subpart, rhs_subpart)
+            for lhs_subpart in range(self.num_lhs)
+            for rhs_subpart in range(self.num_rhs)
+            if (lhs_subpart, rhs_subpart) not in self.done
+            and len(self.locked[lhs_subpart]) == 0
+            and len(self.locked[rhs_subpart]) == 0
+        }
+        if not to_do:
+            raise NothingToAcquire()
+        prev_b = set(self.prev_locked.get(rank, []))
+        lhs_subpart, rhs_subpart = max(to_do, key=lambda sub_b: len(prev_b.intersection(sub_b)))
+        self.locks[rank] = (lhs_subpart, rhs_subpart)
+        self.locked[lhs_subpart][Side.LHS] = rank
+        self.locked[rhs_subpart][Side.RHS] = rank
+        return lhs_subpart, rhs_subpart
+
+    def release(self, rank: Rank) -> None:
+        try:
+            lhs_subpart, rhs_subpart = self.locks[rank]
+        except KeyError:
+            raise ValueError(f"Rank {rank} isn't locking anything") from None
+        del self.locks[rank]
+        del self.locked[lhs_subpart][Side.LHS]
+        del self.locked[rhs_subpart][Side.RHS]
+        self.done.add((lhs_subpart, rhs_subpart))
+        self.prev_locked[rank] = (lhs_subpart, rhs_subpart)
+
+
 def train_and_report_stats(
     config: ConfigSchema,
     model: Optional[MultiRelationEmbedder] = None,
     trainer: Optional[AbstractBatchProcessor] = None,
-    evaluator: Optional[AbstractBatchProcessor] = None,
     rank: Rank = RANK_ZERO,
 ) -> Generator[Tuple[int, Optional[Stats], Stats, Optional[Stats]], None, None]:
     """Each epoch/pass, for each partition pair, loads in embeddings and edgelist
@@ -287,9 +560,12 @@ def train_and_report_stats(
     # Figure out how many lhs and rhs partitions we need
     nparts_lhs, lhs_partitioned_types = get_partitioned_types(config, Side.LHS)
     nparts_rhs, rhs_partitioned_types = get_partitioned_types(config, Side.RHS)
+    lhs_partitioned_types.update(config.entities.keys())
+    rhs_partitioned_types.update(config.entities.keys())
     vlog("nparts %d %d types %s %s" %
          (nparts_lhs, nparts_rhs, lhs_partitioned_types, rhs_partitioned_types))
     total_buckets = nparts_lhs * nparts_rhs
+    num_subparts = config.num_sub_partitions
 
     sync: AbstractSynchronizer
     bucket_scheduler: AbstractBucketScheduler
@@ -377,10 +653,12 @@ def train_and_report_stats(
 
     # fork early for HOGWILD threads
     log("Creating workers...")
-    num_workers = get_num_workers(config.workers)
-    pool = create_pool(num_workers)
+    torch.set_num_threads(1)
+    pool = GPUProcessPool(config.num_gpus)
 
-    def make_optimizer(params: Iterable[torch.nn.Parameter], is_emb: bool) -> Optimizer:
+    holder: EmbeddingHolder = {}
+
+    def make_optimizer(params: Iterable[nn.Parameter], is_emb: bool) -> Optimizer:
         params = list(params)
         if len(params) == 0:
             optimizer = DummyOptimizer()
@@ -423,7 +701,7 @@ def train_and_report_stats(
         part: Partition,
         strict: bool = False,
         force_dirty: bool = False,
-    ) -> Tuple[torch.nn.Parameter, Optional[OptimizerStateDict]]:
+    ) -> Tuple[nn.Parameter, Optional[OptimizerStateDict]]:
         if strict:
             embs, optim_state = checkpoint_manager.read(entity, part,
                                                         force_dirty=force_dirty)
@@ -439,13 +717,16 @@ def train_and_report_stats(
                 embs, optim_state = init_embs(entity, entity_counts[entity][part],
                                               config.dimension, config.init_scale)
         assert embs.is_shared()
-        return torch.nn.Parameter(embs), optim_state
+        return embs, optim_state
 
     log("Initializing global model...")
 
     if model is None:
         model = make_model(config)
     model.share_memory()
+    for param in model.parameters(recurse=True):
+        param.grad: torch.Tensor = param.new_zeros(param.shape)
+        param.grad.share_memory_()
     if trainer is None:
         trainer = Trainer(
             global_optimizer=make_optimizer(model.parameters(), False),
@@ -453,12 +734,6 @@ def train_and_report_stats(
             margin=config.margin,
             relations=config.relations,
         )
-    if evaluator is None:
-        evaluator = TrainingRankingEvaluator(
-            override_num_batch_negs=config.eval_num_batch_negs,
-            override_num_uniform_negs=config.eval_num_uniform_negs,
-        )
-    eval_batch_size = round_up_to_nearest_multiple(config.batch_size, config.eval_num_batch_negs)
 
     state_dict, optim_state = checkpoint_manager.maybe_read_model()
 
@@ -469,16 +744,17 @@ def train_and_report_stats(
     if optim_state is not None:
         trainer.global_optimizer.load_state_dict(optim_state)
 
-    vlog("Loading unpartitioned entities...")
-    for entity, econfig in config.entities.items():
-        if econfig.num_partitions == 1:
-            embs, optim_state = load_embeddings(entity, Partition(0))
-            model.set_embeddings(entity, embs, Side.LHS)
-            model.set_embeddings(entity, embs, Side.RHS)
-            optimizer = make_optimizer([embs], True)
-            if optim_state is not None:
-                optimizer.load_state_dict(optim_state)
-            trainer.entity_optimizers[(entity, Partition(0))] = optimizer
+    # vlog("Loading unpartitioned entities...")
+    # for entity, econfig in config.entities.items():
+    #     if econfig.num_partitions == 1:
+    #         embs, optim_state = load_embeddings(entity, Partition(0))
+    #         embs = nn.Parameter(embs)
+    #         model.set_embeddings(entity, embs, Side.LHS)
+    #         model.set_embeddings(entity, embs, Side.RHS)
+    #         optimizer = make_optimizer([embs], True)
+    #         if optim_state is not None:
+    #             optimizer.load_state_dict(optim_state)
+    #         trainer.unpartitioned_entity_optimizers[entity] = optimizer
 
     # start communicating shared parameters with the parameter server
     if parameter_sharer is not None:
@@ -496,79 +772,71 @@ def train_and_report_stats(
         io_bytes = 0
         log("Swapping partitioned embeddings %s %s" % (old_b, new_b))
 
-        types = ([(e, Side.LHS) for e in lhs_partitioned_types]
-                 + [(e, Side.RHS) for e in rhs_partitioned_types])
-        old_parts = {(e, old_b.get_partition(side)): side
-                     for e, side in types if old_b is not None}
-        new_parts = {(e, new_b.get_partition(side)): side
-                     for e, side in types if new_b is not None}
+        old_parts: Set[Tuple[EntityName, Partition]] = set()
+        if old_b is not None:
+            old_parts.update((e, old_b.lhs) for e in lhs_partitioned_types)
+            old_parts.update((e, old_b.rhs) for e in rhs_partitioned_types)
+        new_parts: Set[Tuple[EntityName, Partition]] = set()
+        if new_b is not None:
+            new_parts.update((e, new_b.lhs) for e in lhs_partitioned_types)
+            new_parts.update((e, new_b.rhs) for e in rhs_partitioned_types)
 
-        to_checkpoint = set(old_parts) - set(new_parts)
-        preserved = set(old_parts) & set(new_parts)
+        to_checkpoint = old_parts - new_parts
+        to_load = new_parts - old_parts
 
         # 1. checkpoint embeddings that will not be used in the next pair
         #
+        log("Writing partitioned embeddings")
+        for entity, part in to_checkpoint:
+            vlog(f"Checkpointing ({entity} {part})")
+
+            perm, permed_embs_p, optimizer = holder[entity, part]
+            optim_state = OptimizerStateDict(optimizer.state_dict())
+            del holder[entity, part]
+
+            permed_embs = permed_embs_p.detach()
+
+            # @nocommit do this in-place
+            rev_perm = torch.argsort(perm)
+            embs = permed_embs.detach()[rev_perm]
+
+            checkpoint_manager.write(entity, part, embs, optim_state)
+            io_bytes += embs.numel() * embs.element_size()  # ignore optim state
+
+            # these variables are holding large objects; let them be freed
+            del embs
+            del optimizer
+            del optim_state
+
         if old_b is not None:  # there are previous embeddings to checkpoint
-            log("Writing partitioned embeddings")
-            for entity, part in to_checkpoint:
-                side = old_parts[(entity, part)]
-                vlog("Checkpointing (%s %d %s)" %
-                     (entity, part, side.pick("lhs", "rhs")))
-                embs = model.get_embeddings(entity, side)
-                optim_key = (entity, part)
-                optim_state = OptimizerStateDict(trainer.entity_optimizers[optim_key].state_dict())
-                io_bytes += embs.numel() * embs.element_size()  # ignore optim state
-                checkpoint_manager.write(entity, part, embs.detach(), optim_state)
-                if optim_key in trainer.entity_optimizers:
-                    del trainer.entity_optimizers[optim_key]
-                # these variables are holding large objects; let them be freed
-                del embs
-                del optim_state
-
             bucket_scheduler.release_bucket(old_b)
-
-        # 2. copy old embeddings that will be used in the next pair
-        #    into a temporary dictionary
-        #
-        tmp_emb = {x: model.get_embeddings(x[0], old_parts[x]) for x in preserved}
-
-        for entity, _ in types:
-            model.clear_embeddings(entity, Side.LHS)
-            model.clear_embeddings(entity, Side.RHS)
-
-        if new_b is None:  # there are no new embeddings to load
-            return io_bytes
 
         # 3. load new embeddings into the model/optimizer, either from disk
         #    or the temporary dictionary
         #
         log("Loading entities")
-        for entity, side in types:
-            part = new_b.get_partition(side)
-            part_key = (entity, part)
-            if part_key in tmp_emb:
-                vlog("Loading (%s, %d) from preserved" % (entity, part))
-                embs, optim_state = tmp_emb[part_key], None
-            else:
-                vlog("Loading (%s, %d)" % (entity, part))
+        for entity, part in to_load:
+            vlog(f"Loading ({entity}, {part})")
 
-                force_dirty = bucket_scheduler.check_and_set_dirty(entity, part)
-                embs, optim_state = load_embeddings(
-                    entity, part, strict=strict, force_dirty=force_dirty)
-                io_bytes += embs.numel() * embs.element_size()  # ignore optim state
+            perm = torch.randperm(entity_counts[entity][part])
+            force_dirty = bucket_scheduler.check_and_set_dirty(entity, part)
+            embs, optim_state = load_embeddings(
+                entity, part, strict=strict, force_dirty=force_dirty)
 
-            model.set_embeddings(entity, embs, side)
-            tmp_emb[part_key] = embs
+            # @nocommit do this in-place
+            storage = torch.FloatStorage._new_shared(embs.numel())
+            permed_embs = torch.FloatTensor(storage).view(embs.shape)
+            torch.index_select(embs, 0, perm, out=permed_embs)
 
-            optim_key = (entity, part)
-            if optim_key not in trainer.entity_optimizers:
-                vlog("Resetting optimizer %s" % (optim_key,))
-                optimizer = make_optimizer([embs], True)
-                if optim_state is not None:
-                    vlog("Setting optim state")
-                    optimizer.load_state_dict(optim_state)
+            permed_embs_p = nn.Parameter(permed_embs)
 
-                trainer.entity_optimizers[optim_key] = optimizer
+            optimizer = make_optimizer([embs], True)
+            if optim_state is not None:
+                vlog("Setting optim state")
+                optimizer.load_state_dict(optim_state)
+            io_bytes += embs.numel() * embs.element_size()  # ignore optim state
+
+            holder[entity, part] = (perm, permed_embs_p, optimizer)
 
         return io_bytes
 
@@ -638,58 +906,117 @@ def train_and_report_stats(
             io_bytes += edges.rhs.tensor.numel() * edges.rhs.tensor.element_size()
             io_bytes += edges.rel.numel() * edges.rel.element_size()
 
-            log_status("Shuffling edges")
-            # Fix a seed to get the same permutation every time; have it
-            # depend on all and only what affects the set of edges.
-            g = torch.Generator()
-            g.manual_seed(hash((edge_path_idx, edge_chunk_idx, cur_b.lhs, cur_b.rhs)))
+            print("Done reading")
 
-            num_eval_edges = int(num_edges * config.eval_fraction)
-            if num_eval_edges > 0:
-                edge_perm = torch.randperm(num_edges, generator=g)
-                eval_edge_perm = edge_perm[-num_eval_edges:]
-                num_edges -= num_eval_edges
-                edge_perm = edge_perm[torch.randperm(num_edges)]
+            offset_to_subpart_map: Dict[Tuple[EntityName, Partition], LongTensorType] = {}
+            subpart_slices: Dict[Tuple[EntityName, Partition, SubPartition], slice] = {}
+            offset_to_suboffset_map: Dict[Tuple[EntityName, Partition], LongTensorType] = {}
+            for (entity_name, part), (perm, embeddings, optimizer) in holder.items():
+                num_entities, _ = embeddings.shape
+                state, = optimizer.state.values()
+                state["sum"] = state["sum"][perm]
+                offset_to_subpart_map[entity_name, part] = torch.empty((num_entities,), dtype=torch.long)
+                offset_to_suboffset_map[entity_name, part] = torch.empty((num_entities,), dtype=torch.long)
+                for subpart, subpart_slice in enumerate(split_almost_equally(num_entities, num_parts=num_subparts)):
+                    offset_to_subpart_map[entity_name, part][perm[subpart_slice]] = subpart
+                    subpart_slices[entity_name, part, subpart] = subpart_slice
+                    offset_to_suboffset_map[entity_name, part][perm[subpart_slice]] = \
+                        torch.arange(subpart_slice.stop - subpart_slice.start)
+
+            print("Done subpartitioning entities")
+            print(subpart_slices)
+            print([(x.min(), x.max()) for x in offset_to_subpart_map.values()])
+            print([(x.min(), x.max()) for x in offset_to_suboffset_map.values()])
+
+            # FIXME only supports non-featurized and non-unpartitioned entity types
+            # FIXME consider masked_scatter and masked_fill and masked_select
+
+            lhs_subparts_storage = torch.LongStorage._new_shared(num_edges)
+            lhs_subparts = torch.LongTensor(lhs_subparts_storage).view((num_edges,))
+            rhs_subparts_storage = torch.LongStorage._new_shared(num_edges)
+            rhs_subparts = torch.LongTensor(rhs_subparts_storage).view((num_edges,))
+            lhs_offsets_storage = torch.LongStorage._new_shared(num_edges)
+            lhs_offsets = torch.LongTensor(lhs_offsets_storage).view((num_edges,))
+            rhs_offsets_storage = torch.LongStorage._new_shared(num_edges)
+            rhs_offsets = torch.LongTensor(rhs_offsets_storage).view((num_edges,))
+            if config.dynamic_relations:
+                rel_config, = config.relations
+                lhs_subparts[:] = offset_to_subpart_map[rel_config.lhs, cur_b.lhs][edges.lhs.tensor]
+                lhs_offsets[:] = offset_to_suboffset_map[rel_config.lhs, cur_b.lhs][edges.lhs.tensor]
+                rhs_subparts[:] = offset_to_subpart_map[rel_config.rhs, cur_b.rhs][edges.rhs.tensor]
+                rhs_offsets[:] = offset_to_suboffset_map[rel_config.rhs, cur_b.rhs][edges.rhs.tensor]
             else:
-                edge_perm = torch.randperm(num_edges)
+                for rel_idx, rel_config in enumerate(config.relations):
+                    this_indices = edges.rel.eq(rel_idx).nonzero().flatten()
+                    this_edges = edges[this_indices]
+                    lhs_subparts[this_indices] = offset_to_subpart_map[rel_config.lhs, cur_b.lhs][this_edges.lhs.tensor]
+                    lhs_offsets[this_indices] = offset_to_suboffset_map[rel_config.lhs, cur_b.lhs][this_edges.lhs.tensor]
+                    rhs_subparts[this_indices] = offset_to_subpart_map[rel_config.rhs, cur_b.rhs][this_edges.rhs.tensor]
+                    rhs_offsets[this_indices] = offset_to_suboffset_map[rel_config.rhs, cur_b.rhs][this_edges.rhs.tensor]
 
-            # HOGWILD evaluation before training
-            eval_stats_before: Optional[Stats] = None
-            if num_eval_edges > 0:
-                log_status("Waiting for workers to perform evaluation")
-                all_eval_stats_before = pool.map(call, [
-                    partial(
-                        process_in_batches,
-                        batch_size=eval_batch_size,
-                        model=model,
-                        batch_processor=evaluator,
-                        edges=edges,
-                        indices=eval_edge_perm[s],
-                    )
-                    for s in split_almost_equally(eval_edge_perm.size(0),
-                                                  num_parts=num_workers)
-                ])
-                eval_stats_before = Stats.sum(all_eval_stats_before).average()
-                log("stats before %s: %s" % (cur_b, eval_stats_before))
+            rel = edges.rel
+            del edges
+
+            print("Done mapping edges to subpartitions")
 
             io_time += time.time() - tic
             tic = time.time()
-            # HOGWILD training
-            log_status("Waiting for workers to perform training")
-            # FIXME should we only delay if iteration_idx == 0?
-            all_stats = pool.map(call, [
-                partial(
-                    process_in_batches,
-                    batch_size=config.batch_size,
+
+            locker = Locker(num_lhs=num_subparts, num_rhs=num_subparts)
+
+            def schedule(gpu_idx: GPURank, lhs_subpart: SubPartition, rhs_subpart: SubPartition) -> None:
+                print(f"GPU #{gpu_idx} gets {lhs_subpart}, {rhs_subpart}")
+                pool.schedule(gpu_idx, SubprocessArgs(
+                    lhs_partitioned_types=lhs_partitioned_types,
+                    rhs_partitioned_types=rhs_partitioned_types,
+                    lhs_part=cur_b.lhs,
+                    rhs_part=cur_b.rhs,
+                    lhs_subpart=lhs_subpart,
+                    rhs_subpart=rhs_subpart,
+                    trainer=trainer,
                     model=model,
-                    batch_processor=trainer,
-                    edges=edges,
-                    indices=edge_perm[s],
-                    delay=config.hogwild_delay if epoch_idx == 0 and rank > 0 else 0,
-                )
-                for rank, s in enumerate(split_almost_equally(edge_perm.size(0),
-                                                              num_parts=num_workers))
-            ])
+                    holder=holder,
+                    subpart_slices=subpart_slices,
+                    rel=rel,
+                    lhs_subparts=lhs_subparts,
+                    rhs_subparts=rhs_subparts,
+                    lhs_offsets=lhs_offsets,
+                    rhs_offsets=rhs_offsets,
+                    batch_size=config.batch_size,
+                    lr=config.lr,
+                ))
+
+            busy_gpus: Set[int] = set()
+            for gpu_idx in range(pool.num_gpus):
+                try:
+                    lhs_subpart, rhs_subpart = locker.acquire(gpu_idx)
+                except NothingToAcquire:
+                    print(f"{num_subparts} sub-partitions aren't enough to "
+                          f"fully utilize all {pool.num_gpus} GPUs: GPU "
+                          f"#{gpu_idx} and later will be idle")
+                    break
+                else:
+                    schedule(gpu_idx, lhs_subpart, rhs_subpart)
+                    busy_gpus.add(gpu_idx)
+
+            all_stats: List[Stats] = []
+            while busy_gpus:
+                for gpu_idx, result in pool.wait():
+                    assert gpu_idx == result.gpu_idx
+                    all_stats.append(result.stats)
+                    locker.release(gpu_idx)
+                    busy_gpus.remove(gpu_idx)
+                for gpu_idx in range(config.num_gpus):
+                    if gpu_idx not in busy_gpus:
+                        try:
+                            lhs_subpart, rhs_subpart = locker.acquire(gpu_idx)
+                        except NothingToAcquire:
+                            pass
+                        else:
+                            schedule(gpu_idx, lhs_subpart, rhs_subpart)
+                            busy_gpus.add(gpu_idx)
+            assert len(locker.done) == num_subparts * num_subparts
+
             stats = Stats.sum(all_stats).average()
             compute_time = time.time() - tic
 
@@ -702,27 +1029,8 @@ def train_and_report_stats(
                 always=True)
             log_status("%s" % stats, always=True)
 
-            # HOGWILD eval after training
-            eval_stats_after: Optional[Stats] = None
-            if num_eval_edges > 0:
-                log_status("Waiting for workers to perform evaluation")
-                all_eval_stats_after = pool.map(call, [
-                    partial(
-                        process_in_batches,
-                        batch_size=eval_batch_size,
-                        model=model,
-                        batch_processor=evaluator,
-                        edges=edges,
-                        indices=eval_edge_perm[s],
-                    )
-                    for s in split_almost_equally(eval_edge_perm.size(0),
-                                                  num_parts=num_workers)
-                ])
-                eval_stats_after = Stats.sum(all_eval_stats_after).average()
-                log("stats after %s: %s" % (cur_b, eval_stats_after))
-
             # Add train/eval metrics to queue
-            yield current_index, eval_stats_before, stats, eval_stats_after
+            yield current_index, None, stats, None
 
         swap_partitioned_embeddings(cur_b, None)
 
@@ -734,14 +1042,14 @@ def train_and_report_stats(
             % (epoch_idx + 1, edge_path_idx + 1, edge_chunk_idx + 1))
         log("My rank: %d" % rank)
         if rank == 0:
-            for entity, econfig in config.entities.items():
-                if econfig.num_partitions == 1:
-                    embs = model.get_embeddings(entity, Side.LHS)
-                    optimizer = trainer.entity_optimizers[(entity, Partition(0))]
-
-                    checkpoint_manager.write(
-                        entity, Partition(0),
-                        embs.detach(), OptimizerStateDict(optimizer.state_dict()))
+            # for entity, econfig in config.entities.items():
+            #     if econfig.num_partitions == 1:
+            #         embs = model.get_embeddings(entity, Side.LHS)
+            #         optimizer = trainer.unpartitioned_entity_optimizers[entity]
+            #
+            #         checkpoint_manager.write(
+            #             entity, Partition(0),
+            #             embs.detach(), OptimizerStateDict(optimizer.state_dict()))
 
             sanitized_state_dict: ModuleStateDict = {}
             for k, v in ModuleStateDict(model.state_dict()).items():
@@ -779,7 +1087,6 @@ def train_and_report_stats(
         strict = True
 
     # quiescence
-    pool.close()
     pool.join()
 
     sync.barrier()
@@ -797,11 +1104,10 @@ def train(
     config: ConfigSchema,
     model: Optional[MultiRelationEmbedder] = None,
     trainer: Optional[AbstractBatchProcessor] = None,
-    evaluator: Optional[AbstractBatchProcessor] = None,
     rank: Rank = RANK_ZERO,
 ) -> None:
     # Create and run the generator until exhaustion.
-    for _ in train_and_report_stats(config, model, trainer, evaluator, rank):
+    for _ in train_and_report_stats(config, model, trainer, rank):
         pass
 
 

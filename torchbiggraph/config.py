@@ -376,6 +376,14 @@ class ConfigSchema(Schema):
                           "one of its partitions is 0, for bootstrapping)."},
     )
 
+    num_sub_partitions: int = attr.ib(
+        default=1,
+    )
+
+    num_gpus: int = attr.ib(
+        default=1,
+    )
+
     # Additional global validation.
 
     def __attrs_post_init__(self):

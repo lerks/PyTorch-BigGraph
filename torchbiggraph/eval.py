@@ -8,9 +8,10 @@
 
 import argparse
 import time
+import os
 from functools import partial
 from itertools import chain
-from typing import Generator, List, Optional, Tuple
+from typing import Dict, Generator, List, Optional, Tuple
 
 import torch
 
@@ -89,6 +90,15 @@ def do_eval_and_report_stats(
     if config.verbose > 0:
         import pprint
         pprint.PrettyPrinter().pprint(config.to_dict())
+
+    entity_counts: Dict[str, List[int]] = {}
+    for entity, econf in config.entities.items():
+        entity_counts[entity] = []
+        for part in range(econf.num_partitions):
+            with open(os.path.join(
+                config.entity_path, "entity_count_%s_%d.txt" % (entity, part)
+            ), "rt") as tf:
+                entity_counts[entity].append(int(tf.read().strip()))
 
     checkpoint_manager = CheckpointManager(config.checkpoint_path)
 

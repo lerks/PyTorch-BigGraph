@@ -17,17 +17,16 @@ class RowAdagrad(Optimizer):
     Code mostly copy-pasted from torch/optim/Adagrad
     """
 
-    def __init__(self, params, lr=1e-2, lr_decay=0, weight_decay=0):
-        defaults = dict(lr=lr, lr_decay=lr_decay, weight_decay=weight_decay)
+    def __init__(self, params, lr=1e-2, weight_decay=0):
+        defaults = dict(lr=lr, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
         for group in self.param_groups:
             for p in group['params']:
+                if p.dim() != 2:
+                    raise ValueError("RowAdagrad only works on 2D tensors")
                 state = self.state[p]
-                state['step'] = 0
-                assert p.data.ndimension() == 2, (
-                    "RowAdagrad only works on 2D parameter tensors")
-                state['sum'] = p.data.new().resize_(p.data.size(0)).zero_()
+                state['sum'] = p.new_zeros((p.shape[0],))
 
     def share_memory(self):
         for group in self.param_groups:
@@ -54,15 +53,11 @@ class RowAdagrad(Optimizer):
                 grad = p.grad.data
                 state = self.state[p]
 
-                state['step'] += 1
-
                 if group['weight_decay'] != 0:
                     if grad.is_sparse:
                         raise RuntimeError("weight_decay option is not "
                                            "compatible with sparse gradients ")
                     grad = grad.add(group['weight_decay'], p.data)
-
-                clr = group['lr'] / (1 + (state['step'] - 1) * group['lr_decay'])
 
                 if grad.is_sparse:
                     if grad._indices().numel() == 0:
@@ -75,12 +70,10 @@ class RowAdagrad(Optimizer):
                     state['sum'].index_add_(0, grad_indices, (grad_values * grad_values).mean(1))
                     std = state['sum'][grad_indices]  # _sparse_mask
                     std_values = std.sqrt_().add_(1e-10).unsqueeze(1)
-                    # print('std_values')
-                    # print(std_values)
-                    p.data.index_add_(0, grad_indices, -clr * grad_values / std_values)
+                    p.data.index_add_(0, grad_indices, -group['lr'] * grad_values / std_values)
                 else:
                     state['sum'] += (grad * grad).mean(1)
                     std = state['sum'].sqrt().add_(1e-10)
-                    p.data.addcdiv_(-clr, grad, std.unsqueeze(1))
+                    p.data.addcdiv_(-group['lr'], grad, std.unsqueeze(1))
 
         return loss

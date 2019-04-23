@@ -47,7 +47,7 @@ class EntityList:
             TensorList.cat(el.tensor_list for el in entity_lists))
 
     def __init__(self, tensor: LongTensorType, tensor_list: TensorList) -> None:
-        if not isinstance(tensor, torch.LongTensor):
+        if not isinstance(tensor, (torch.LongTensor, torch.cuda.LongTensor)):
             raise TypeError(
                 "Expected long tensor as first argument, got %s" % type(tensor))
         if not isinstance(tensor_list, TensorList):
@@ -101,7 +101,7 @@ class EntityList:
         if isinstance(index, int):
             return self[index:index + 1]
 
-        if isinstance(index, torch.LongTensor) or isinstance(index, int):
+        if isinstance(index, (torch.LongTensor, torch.cuda.LongTensor)) or isinstance(index, int):
             tensor_sub = self.tensor[index]
             tensor_list_sub = self.tensor_list[index]
             return type(self)(tensor_sub, tensor_list_sub)
@@ -118,3 +118,9 @@ class EntityList:
 
     def __len__(self) -> int:
         return self.tensor.shape[0]
+
+    def to(self, device: torch.device, *, non_blocking: bool = False, copy: bool = False) -> "EntityList":
+        return type(self)(
+            self.tensor.to(device, non_blocking=non_blocking, copy=copy),
+            self.tensor_list.to(device, non_blocking=non_blocking, copy=copy),
+        )

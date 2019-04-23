@@ -36,6 +36,7 @@ from torchbiggraph.types import (
     OptimizerStateDict,
     Partition,
     Rank,
+    LongTensorType,
 )
 from torchbiggraph.util import create_pool, log, vlog
 
@@ -101,9 +102,12 @@ class EdgeReader:
             end = int((chunk_idx + 1) * num_edges / num_chunks)
             chunk_size = end - begin
 
-            lhs = torch.empty((chunk_size,), dtype=torch.long)
-            rhs = torch.empty((chunk_size,), dtype=torch.long)
-            rel = torch.empty((chunk_size,), dtype=torch.long)
+            lhs_storage = torch.LongStorage._new_shared(chunk_size)
+            lhs = torch.LongTensor(lhs_storage).view((chunk_size,))
+            rhs_storage = torch.LongStorage._new_shared(chunk_size)
+            rhs = torch.LongTensor(rhs_storage).view((chunk_size,))
+            rel_storage = torch.LongStorage._new_shared(chunk_size)
+            rel = torch.LongTensor(rel_storage).view((chunk_size,))
 
             # Needed because https://github.com/h5py/h5py/issues/870.
             if chunk_size > 0:

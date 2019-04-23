@@ -84,7 +84,7 @@ class TensorList(object):
 
     def __init__(self, offsets, data):
         # some sanity checks
-        assert(isinstance(offsets, torch.LongTensor))
+        assert(isinstance(offsets, (torch.LongTensor, torch.cuda.LongTensor)))
         assert(offsets.ndimension() == 1)
         assert(offsets[0] == 0)
         assert(offsets[-1] == (data.size(0) if data.ndimension() > 0 else 0))
@@ -99,7 +99,7 @@ class TensorList(object):
         self.data = data
 
     def __getitem__(self, index):
-        if isinstance(index, torch.LongTensor):
+        if isinstance(index, (torch.LongTensor, torch.cuda.LongTensor)):
             offsets_sub = self.offsets[index]
             sizes_sub = self.offsets[index + 1] - offsets_sub
             new_offsets, new_data = _extract_intervals(
@@ -156,3 +156,9 @@ class TensorList(object):
 
     def nelement(self):
         return self.data.nelement()
+
+    def to(self, device: torch.device, *, non_blocking: bool = False, copy: bool = False) -> "TensorList":
+        return type(self)(
+            self.offsets.to(device, non_blocking=non_blocking, copy=copy),
+            self.data.to(device, non_blocking=non_blocking, copy=copy),
+        )
